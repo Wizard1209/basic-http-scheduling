@@ -7,10 +7,18 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from fastapi import FastAPI, Request, Header, HTTPException
 from fastapi.responses import JSONResponse
-import aio_pika
 import config
 from models import DelayedRequest
-from rabbitmq import get_connection, setup_queues, publish_delayed_request, close_connection
+from redis_queue import (
+    get_redis_client,
+    close_redis_client,
+    enqueue_delayed_request,
+    acquire_ready_job,
+    get_request_data,
+    complete_job,
+    recover_abandoned_jobs,
+    get_queue_stats
+)
 
 # Maximum delay: 2,147,483,647 seconds (max 32-bit int, ~68 years)
 MAX_DELAY_SECONDS = 2147483647
@@ -60,62 +68,114 @@ async def forward_request(request: DelayedRequest) -> None:
         )
 
 
-async def consume_processing_queue():
-    connection = await get_connection()
-    channel = await connection.channel()
-    
-    await channel.set_qos(prefetch_count=1)
-    
-    queue = await channel.get_queue(config.PROCESSING_QUEUE)
-    
-    async def process_message(message: aio_pika.IncomingMessage):
-        async with message.process():
-            try:
-                request = DelayedRequest.model_validate_json(message.body.decode())
+async def poll_and_process_jobs():
+    """
+    Main worker loop: polls for ready jobs and processes them.
 
-                # Calculate actual delay
-                now = datetime.now(timezone.utc)
-                actual_delay = (now - request.timestamp).total_seconds()
-                delay_diff = actual_delay - request.delay_seconds
+    Uses adaptive polling with recovery checks.
+    """
+    logger.info('Worker started - polling for ready jobs')
 
-                logger.info(
-                    f'[{request.request_id}] Consumed from {config.PROCESSING_QUEUE} '
-                    f'(intended: {request.delay_seconds}s, actual: {actual_delay:.2f}s, '
-                    f'diff: {delay_diff:+.2f}s)'
-                )
+    # Recovery check interval (every 5 minutes)
+    last_recovery_check = time.time()
+    recovery_interval = 300
 
-                await forward_request(request)
+    while True:
+        try:
+            # Periodic recovery check
+            if time.time() - last_recovery_check > recovery_interval:
+                recovered = await recover_abandoned_jobs()
+                if recovered > 0:
+                    logger.info(f'Recovered {recovered} abandoned jobs')
+                last_recovery_check = time.time()
 
-                logger.info(f'[{request.request_id}] Message acknowledged')
+            # Try to acquire a ready job
+            job_id = await acquire_ready_job()
 
-            except Exception as e:
-                logger.error(f'Error processing message: {e}')
-                raise
-    
-    logger.info(f'Worker started. Consuming from {config.PROCESSING_QUEUE}')
-    await queue.consume(process_message)
+            if job_id:
+                # Job acquired - process it
+                logger.info(f'[{job_id}] Acquired job for processing')
+
+                # Get request data
+                request = await get_request_data(job_id)
+
+                if request:
+                    # Calculate actual delay
+                    now = datetime.now(timezone.utc)
+                    actual_delay = (now - request.timestamp).total_seconds()
+                    delay_diff = actual_delay - request.delay_seconds
+
+                    logger.info(
+                        f'[{job_id}] Processing (intended: {request.delay_seconds}s, '
+                        f'actual: {actual_delay:.2f}s, diff: {delay_diff:+.2f}s)'
+                    )
+
+                    # Forward the request
+                    await forward_request(request)
+
+                    # Mark as complete
+                    await complete_job(job_id)
+                else:
+                    logger.error(f'[{job_id}] Request data not found')
+                    await complete_job(job_id)
+
+                # Don't sleep - immediately check for next job
+            else:
+                # No jobs ready - sleep before next poll
+                await asyncio.sleep(config.POLL_INTERVAL_SECONDS)
+
+        except Exception as e:
+            logger.error(f'Worker error: {e}', exc_info=True)
+            await asyncio.sleep(config.POLL_INTERVAL_SECONDS)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    await setup_queues()
-    
-    consumer_task = asyncio.create_task(consume_processing_queue())
+    # Initialize Redis connection
+    await get_redis_client()
+    logger.info('Redis connection established')
+
+    # Start worker task
+    worker_task = asyncio.create_task(poll_and_process_jobs())
     logger.info('Background worker task started')
-    
+
     yield
-    
-    consumer_task.cancel()
+
+    # Shutdown
+    worker_task.cancel()
     try:
-        await consumer_task
+        await worker_task
     except asyncio.CancelledError:
         pass
-    
-    await close_connection()
+
+    await close_redis_client()
     logger.info('Application shutdown complete')
 
 
 app = FastAPI(title='Basic HTTP Scheduling', lifespan=lifespan)
+
+
+@app.get('/health')
+async def health_check():
+    """Health check endpoint with queue statistics."""
+    try:
+        stats = await get_queue_stats()
+        # Check which event loop is being used
+        import asyncio
+        loop = asyncio.get_running_loop()
+        loop_type = f"{type(loop).__module__}.{type(loop).__name__}"
+
+        return {
+            'status': 'healthy',
+            'event_loop': loop_type,
+            **stats
+        }
+    except Exception as e:
+        logger.error(f'Health check failed: {e}')
+        return JSONResponse(
+            status_code=503,
+            content={'status': 'unhealthy', 'error': str(e)}
+        )
 
 
 @app.post('/{target_url:path}')
@@ -175,7 +235,7 @@ async def proxy_request(
     )
     
     try:
-        await publish_delayed_request(delayed_req, x_delay_seconds)
+        await enqueue_delayed_request(delayed_req, x_delay_seconds)
         logger.info(
             f'[{request_id}] Queued successfully: '
             f'{target_url} (delay={x_delay_seconds}s)'
@@ -197,8 +257,21 @@ async def proxy_request(
 if __name__ == '__main__':
     import uvicorn
     logger.info(f'Starting Basic HTTP Scheduling on {config.API_HOST}:{config.API_PORT}')
-    uvicorn.run(
-        app,
-        host=config.API_HOST,
-        port=config.API_PORT
-    )
+
+    # Check if uvloop is available and use it with uvicorn
+    try:
+        import uvloop
+        logger.info(f'Using uvloop {uvloop.__version__} for event loop')
+        uvicorn.run(
+            app,
+            host=config.API_HOST,
+            port=config.API_PORT,
+            loop='uvloop'
+        )
+    except ImportError:
+        logger.warning('uvloop not available, using default asyncio event loop')
+        uvicorn.run(
+            app,
+            host=config.API_HOST,
+            port=config.API_PORT
+        )

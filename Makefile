@@ -13,7 +13,10 @@ down:
 	docker compose down
 
 logs:
-	docker compose logs -f
+	docker compose logs -f app
+
+logs-rabbit:
+	docker compose logs -f rabbitmq
 
 pull:
 	git pull

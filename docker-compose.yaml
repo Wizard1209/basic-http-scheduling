@@ -1,22 +1,20 @@
 services:
-  rabbitmq:
-    image: rabbitmq:3.13-management
-    container_name: basic-http-scheduling-rabbitmq
+  redis:
+    image: redis:7-alpine
+    container_name: basic-http-scheduling-redis
     restart: unless-stopped
     ports:
-      - "5672:5672"   # AMQP
-      - "15672:15672" # Management UI (guest/guest)
-    environment:
-      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER}
-      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASS}
+      - "6379:6379"
     volumes:
-      - rabbitmq_data:/var/lib/rabbitmq
+      - redis_data:/data
     networks:
       - monitoring
+    # Enable AOF persistence for durability
+    command: redis-server --appendonly yes --appendfsync everysec
     healthcheck:
-      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
-      interval: 30s
-      timeout: 10s
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
       retries: 5
 
   app:
@@ -38,12 +36,12 @@ services:
       - "traefik.http.routers.http-scheduler.tls=true"
       - "traefik.http.routers.http-scheduler.tls.certResolver=lets-encrypt-ssl"
     depends_on:
-      rabbitmq:
+      redis:
         condition: service_healthy
 
 
 volumes:
-  rabbitmq_data:
+  redis_data:
     driver: local
 
 networks:

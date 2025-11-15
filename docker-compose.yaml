@@ -29,7 +29,7 @@ services:
     restart: unless-stopped
     env_file:
       - .env
-    ports:
+    expose:
       - 8080
     networks:
       - monitoring
@@ -38,6 +38,7 @@ services:
       - "traefik.http.routers.http-scheduler.rule=Host(`${WEBHOOK_HOST}`)"
       - "traefik.http.routers.http-scheduler.tls=true"
       - "traefik.http.routers.http-scheduler.tls.certResolver=lets-encrypt-ssl"
+      - traefik.http.services.http-scheduler.loadbalancer.server.port=8000
     depends_on:
       redis:
         condition: service_healthy

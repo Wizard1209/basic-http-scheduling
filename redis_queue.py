@@ -1,38 +1,13 @@
 import logging
 import time
-import json
-from typing import Optional
+import orjson
 import redis.asyncio as aioredis
 import config
 from models import DelayedRequest
 
 logger = logging.getLogger(__name__)
 
-_redis_client: Optional[aioredis.Redis] = None
-
-# Lua script for atomic job acquisition (prevents race conditions)
-ACQUIRE_JOB_SCRIPT = """
-local delayed_key = KEYS[1]
-local processing_key = KEYS[2]
-local current_time = tonumber(ARGV[1])
-local processing_timeout = tonumber(ARGV[2])
-
--- Get the first ready job (score <= current_time)
-local jobs = redis.call('ZRANGEBYSCORE', delayed_key, '-inf', current_time, 'LIMIT', 0, 1)
-
-if #jobs == 0 then
-    return nil
-end
-
-local job_id = jobs[1]
-
--- Move to processing set with timeout score
-local processing_score = current_time + processing_timeout
-redis.call('ZADD', processing_key, processing_score, job_id)
-redis.call('ZREM', delayed_key, job_id)
-
-return job_id
-"""
+_redis_client: aioredis.Redis | None = None
 
 
 async def get_redis_client() -> aioredis.Redis:
@@ -68,31 +43,30 @@ async def enqueue_delayed_request(
     Enqueue a delayed request using Redis sorted set.
 
     Score = current_time + delay_seconds (in milliseconds)
-    Member = request_id
+    Member = JSON-serialized request data (no separate hash needed)
     """
     client = await get_redis_client()
 
     # Calculate execution timestamp (milliseconds)
     execution_time_ms = int((time.time() + delay_seconds) * 1000)
 
-    # Store request data in hash
-    request_key = f"{config.REQUEST_DATA_PREFIX}{request.request_id}"
-    await client.hset(
-        request_key,
-        mapping={
-            'target_url': request.target_url,
-            'method': request.method,
-            'headers': json.dumps(request.headers),
-            'body': json.dumps(request.body) if request.body else '',
-            'timestamp': request.timestamp.isoformat(),
-            'delay_seconds': str(delay_seconds)
-        }
-    )
+    # Serialize entire request as JSON to store in sorted set member
+    request_data = {
+        'request_id': request.request_id,
+        'target_url': request.target_url,
+        'method': request.method,
+        'headers': request.headers,
+        'body': request.body,
+        'timestamp': request.timestamp.isoformat(),
+        'delay_seconds': delay_seconds
+    }
+    # orjson.dumps() returns bytes, decode to str for Redis
+    request_json = orjson.dumps(request_data).decode('utf-8')
 
-    # Add to delayed queue sorted set
+    # Add to queue sorted set with request data as member
     await client.zadd(
         config.DELAYED_QUEUE_KEY,
-        {request.request_id: execution_time_ms}
+        {request_json: execution_time_ms}
     )
 
     logger.info(
@@ -101,96 +75,95 @@ async def enqueue_delayed_request(
     )
 
 
-async def acquire_ready_job() -> Optional[str]:
+async def acquire_ready_jobs() -> tuple[list[DelayedRequest], float]:
     """
-    Atomically acquire a ready job using Lua script.
+    Retrieve ALL ready jobs using ZRANGEBYSCORE (batch retrieval).
 
-    Returns job_id if available, None otherwise.
-    """
-    client = await get_redis_client()
+    Uses ZRANGEBYSCORE to get all jobs with score <= current_time.
+    Returns tuple of (jobs_list, max_score_retrieved).
+    The max_score is used later for cleanup with ZREMRANGEBYSCORE.
 
-    current_time_ms = int(time.time() * 1000)
-    processing_timeout_ms = int(config.PROCESSING_TIMEOUT_SECONDS * 1000)
-
-    # Register Lua script
-    acquire_script = client.register_script(ACQUIRE_JOB_SCRIPT)
-
-    # Execute atomic acquisition
-    job_id = await acquire_script(
-        keys=[config.DELAYED_QUEUE_KEY, config.PROCESSING_QUEUE_KEY],
-        args=[current_time_ms, processing_timeout_ms]
-    )
-
-    return job_id
-
-
-async def get_request_data(request_id: str) -> Optional[DelayedRequest]:
-    """Retrieve request data from Redis hash."""
-    client = await get_redis_client()
-
-    request_key = f"{config.REQUEST_DATA_PREFIX}{request_id}"
-    data = await client.hgetall(request_key)
-
-    if not data:
-        return None
-
-    # Reconstruct DelayedRequest object
-    from datetime import datetime
-    return DelayedRequest(
-        request_id=request_id,
-        target_url=data['target_url'],
-        method=data['method'],
-        headers=json.loads(data['headers']),
-        body=json.loads(data['body']) if data['body'] else None,
-        timestamp=datetime.fromisoformat(data['timestamp']),
-        delay_seconds=int(data['delay_seconds'])
-    )
-
-
-async def complete_job(request_id: str) -> None:
-    """Remove job from processing set and delete request data."""
-    client = await get_redis_client()
-
-    # Remove from processing set
-    await client.zrem(config.PROCESSING_QUEUE_KEY, request_id)
-
-    # Delete request data
-    request_key = f"{config.REQUEST_DATA_PREFIX}{request_id}"
-    await client.delete(request_key)
-
-    logger.info(f'[{request_id}] Job completed and removed')
-
-
-async def recover_abandoned_jobs() -> int:
-    """
-    Recover jobs abandoned due to worker crashes.
-
-    Moves jobs in processing set with expired timeout back to delayed queue.
+    Returns empty list and -inf if no jobs ready.
     """
     client = await get_redis_client()
 
     current_time_ms = int(time.time() * 1000)
 
-    # Find abandoned jobs (processing score < current time)
-    abandoned = await client.zrangebyscore(
-        config.PROCESSING_QUEUE_KEY,
+    # ZRANGEBYSCORE: Get all jobs with score from -inf to current_time
+    # Returns: [(member, score), (member, score), ...] with withscores=True
+    result = await client.zrangebyscore(
+        config.DELAYED_QUEUE_KEY,
         '-inf',
-        current_time_ms
+        current_time_ms,
+        withscores=True
     )
 
-    if not abandoned:
+    if not result:
+        # Queue is empty or no jobs ready
+        return [], float('-inf')
+
+    # Parse all retrieved jobs
+    from datetime import datetime
+    jobs = []
+    max_score = float('-inf')
+
+    # Result with withscores=True is: [(member1, score1), (member2, score2), ...]
+    for item in result:
+        request_json, score = item
+        score = float(score)
+
+        # Track max score for cleanup
+        max_score = max(max_score, score)
+
+        # Decode if bytes
+        if isinstance(request_json, bytes):
+            request_json = request_json.decode('utf-8')
+
+        # Parse request data using orjson
+        data = orjson.loads(request_json.encode('utf-8') if isinstance(request_json, str) else request_json)
+        request = DelayedRequest(
+            request_id=data['request_id'],
+            target_url=data['target_url'],
+            method=data['method'],
+            headers=data['headers'],
+            body=data['body'],
+            timestamp=datetime.fromisoformat(data['timestamp']),
+            delay_seconds=data['delay_seconds']
+        )
+        jobs.append(request)
+
+    logger.debug(f'Acquired {len(jobs)} ready jobs (max_score={max_score}, current={current_time_ms})')
+    return jobs, max_score
+
+
+async def cleanup_processed_jobs(max_score: float) -> int:
+    """
+    Remove processed jobs from queue using ZREMRANGEBYSCORE.
+
+    Removes all jobs with score from -inf to max_score (inclusive).
+    This should be called after successfully processing a batch of jobs.
+
+    Args:
+        max_score: The maximum score from the batch that was processed
+
+    Returns:
+        Number of jobs removed from queue
+    """
+    if max_score == float('-inf'):
+        # No jobs to clean up
         return 0
 
-    # Move back to delayed queue with immediate execution
-    for job_id in abandoned:
-        await client.zadd(
-            config.DELAYED_QUEUE_KEY,
-            {job_id: current_time_ms}
-        )
-        await client.zrem(config.PROCESSING_QUEUE_KEY, job_id)
-        logger.warning(f'[{job_id}] Recovered abandoned job')
+    client = await get_redis_client()
 
-    return len(abandoned)
+    # Remove all jobs with score <= max_score
+    removed = await client.zremrangebyscore(
+        config.DELAYED_QUEUE_KEY,
+        '-inf',
+        max_score
+    )
+
+    logger.debug(f'Cleaned up {removed} processed jobs (score <= {max_score})')
+    return removed
 
 
 async def get_queue_stats() -> dict:
@@ -198,14 +171,12 @@ async def get_queue_stats() -> dict:
     client = await get_redis_client()
 
     delayed_count = await client.zcard(config.DELAYED_QUEUE_KEY)
-    processing_count = await client.zcard(config.PROCESSING_QUEUE_KEY)
 
     # Get Redis memory info
     info = await client.info('memory')
 
     return {
         'delayed_jobs': delayed_count,
-        'processing_jobs': processing_count,
         'redis_memory_used_mb': info['used_memory'] / 1024 / 1024,
         'redis_connected': True
     }

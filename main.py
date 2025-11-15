@@ -13,10 +13,8 @@ from redis_queue import (
     get_redis_client,
     close_redis_client,
     enqueue_delayed_request,
-    acquire_ready_job,
-    get_request_data,
-    complete_job,
-    recover_abandoned_jobs,
+    acquire_ready_jobs,
+    cleanup_processed_jobs,
     get_queue_stats
 )
 
@@ -70,56 +68,42 @@ async def forward_request(request: DelayedRequest) -> None:
 
 async def poll_and_process_jobs():
     """
-    Main worker loop: polls for ready jobs and processes them.
+    Main worker loop: polls for ready jobs and processes them in batches.
 
-    Uses adaptive polling with recovery checks.
+    Uses ZRANGEBYSCORE to retrieve all ready jobs, processes them all,
+    then removes them with ZREMRANGEBYSCORE.
     """
-    logger.info('Worker started - polling for ready jobs')
-
-    # Recovery check interval (every 5 minutes)
-    last_recovery_check = time.time()
-    recovery_interval = 300
+    logger.info('Worker started - polling for ready jobs (batch mode)')
 
     while True:
         try:
-            # Periodic recovery check
-            if time.time() - last_recovery_check > recovery_interval:
-                recovered = await recover_abandoned_jobs()
-                if recovered > 0:
-                    logger.info(f'Recovered {recovered} abandoned jobs')
-                last_recovery_check = time.time()
+            # Acquire ALL ready jobs in batch
+            jobs, max_score = await acquire_ready_jobs()
 
-            # Try to acquire a ready job
-            job_id = await acquire_ready_job()
+            if jobs:
+                # Jobs acquired - process all of them
+                logger.info(f'Acquired {len(jobs)} jobs for batch processing')
 
-            if job_id:
-                # Job acquired - process it
-                logger.info(f'[{job_id}] Acquired job for processing')
-
-                # Get request data
-                request = await get_request_data(job_id)
-
-                if request:
+                # Process each job
+                for request in jobs:
                     # Calculate actual delay
                     now = datetime.now(timezone.utc)
                     actual_delay = (now - request.timestamp).total_seconds()
                     delay_diff = actual_delay - request.delay_seconds
 
                     logger.info(
-                        f'[{job_id}] Processing (intended: {request.delay_seconds}s, '
+                        f'[{request.request_id}] Processing (intended: {request.delay_seconds}s, '
                         f'actual: {actual_delay:.2f}s, diff: {delay_diff:+.2f}s)'
                     )
 
-                    # Forward the request
+                    # Forward the request (never raises exceptions)
                     await forward_request(request)
 
-                    # Mark as complete
-                    await complete_job(job_id)
-                else:
-                    logger.error(f'[{job_id}] Request data not found')
-                    await complete_job(job_id)
+                # All jobs processed - remove them from queue
+                removed = await cleanup_processed_jobs(max_score)
+                logger.info(f'Batch complete: processed {len(jobs)} jobs, removed {removed} from queue')
 
-                # Don't sleep - immediately check for next job
+                # Don't sleep - immediately check for next batch
             else:
                 # No jobs ready - sleep before next poll
                 await asyncio.sleep(config.POLL_INTERVAL_SECONDS)

@@ -64,10 +64,19 @@ async def enqueue_delayed_request(
     request_json = orjson.dumps(request_data).decode('utf-8')
 
     # Add to queue sorted set with request data as member
-    await client.zadd(
+    # NX flag: only add new elements, don't update existing ones
+    added = await client.zadd(
         config.DELAYED_QUEUE_KEY,
-        {request_json: execution_time_ms}
+        {request_json: execution_time_ms},
+        nx=True
     )
+
+    if added == 0:
+        logger.error(
+            f'[{request.request_id}] FAILED to enqueue - job already exists in queue! '
+            f'This indicates a duplicate request or race condition.'
+        )
+        raise ValueError(f'Job {request.request_id} already exists in queue')
 
     logger.info(
         f'[{request.request_id}] Enqueued with execution time: '

@@ -10,7 +10,8 @@ services:
     networks:
       - monitoring
     # Enable AOF persistence for durability
-    command: redis-server --appendonly yes --appendfsync everysec
+    # Use noeviction to prevent job loss when memory is full
+    command: redis-server --appendonly yes --appendfsync everysec --maxmemory-policy noeviction
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 10s

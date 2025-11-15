@@ -15,8 +15,8 @@ down:
 logs:
 	docker compose logs -f app
 
-logs-rabbit:
-	docker compose logs -f rabbitmq
+logs-redis:
+	docker compose logs -f redis
 
 pull:
 	git pull

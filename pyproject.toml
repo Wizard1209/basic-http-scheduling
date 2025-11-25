@@ -7,8 +7,13 @@ requires-python = ">=3.13"
 dependencies = [
     "fastapi>=0.121.1",
     "httpx>=0.28.1",
-    "orjson>=3.10.0",
     "redis>=5.2.0",
     "uvicorn[standard]>=0.38.0",
     "uvloop>=0.21.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0.0",
+    "orjson>=3.10.0",  # only for backwards compat test
 ]

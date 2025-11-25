@@ -1,6 +1,5 @@
 import logging
 import time
-import orjson
 import redis.asyncio as aioredis
 import config
 from models import DelayedRequest
@@ -35,33 +34,18 @@ async def close_redis_client() -> None:
         _redis_client = None
 
 
-async def enqueue_delayed_request(
-    request: DelayedRequest,
-    delay_seconds: int
-) -> None:
+async def enqueue_request(request: DelayedRequest, execution_time_ms: int) -> None:
     """
-    Enqueue a delayed request using Redis sorted set.
+    Enqueue a request using Redis sorted set.
 
-    Score = current_time + delay_seconds (in milliseconds)
-    Member = JSON-serialized request data (no separate hash needed)
+    Args:
+        request: The DelayedRequest to enqueue (already fully formed)
+        execution_time_ms: Unix timestamp in milliseconds when job should execute
     """
     client = await get_redis_client()
 
-    # Calculate execution timestamp (milliseconds)
-    execution_time_ms = int((time.time() + delay_seconds) * 1000)
-
-    # Serialize entire request as JSON to store in sorted set member
-    request_data = {
-        'request_id': request.request_id,
-        'target_url': request.target_url,
-        'method': request.method,
-        'headers': request.headers,
-        'body': request.body,
-        'timestamp': request.timestamp.isoformat(),
-        'delay_seconds': delay_seconds
-    }
-    # orjson.dumps() returns bytes, decode to str for Redis
-    request_json = orjson.dumps(request_data).decode('utf-8')
+    # Serialize using Pydantic's model_dump_json (uses pydantic-core Rust serializer)
+    request_json = request.model_dump_json()
 
     # Add to queue sorted set with request data as member
     # NX flag: only add new elements, don't update existing ones
@@ -79,8 +63,7 @@ async def enqueue_delayed_request(
         raise ValueError(f'Job {request.request_id} already exists in queue')
 
     logger.info(
-        f'[{request.request_id}] Enqueued with execution time: '
-        f'{execution_time_ms}ms (delay={delay_seconds}s)'
+        f'[{request.request_id}] Enqueued at {execution_time_ms}ms ({request.get_display_delay()})'
     )
 
 
@@ -112,7 +95,6 @@ async def acquire_ready_jobs() -> tuple[list[DelayedRequest], float]:
         return [], float('-inf')
 
     # Parse all retrieved jobs
-    from datetime import datetime
     jobs = []
     max_score = float('-inf')
 
@@ -124,21 +106,9 @@ async def acquire_ready_jobs() -> tuple[list[DelayedRequest], float]:
         # Track max score for cleanup
         max_score = max(max_score, score)
 
-        # Decode if bytes
-        if isinstance(request_json, bytes):
-            request_json = request_json.decode('utf-8')
-
-        # Parse request data using orjson
-        data = orjson.loads(request_json.encode('utf-8') if isinstance(request_json, str) else request_json)
-        request = DelayedRequest(
-            request_id=data['request_id'],
-            target_url=data['target_url'],
-            method=data['method'],
-            headers=data['headers'],
-            body=data['body'],
-            timestamp=datetime.fromisoformat(data['timestamp']),
-            delay_seconds=data['delay_seconds']
-        )
+        # Parse using pydantic-core (Rust JSON parser + validation in one step)
+        # Handles backwards compat: missing delay_timestamp defaults to None
+        request = DelayedRequest.model_validate_json(request_json)
         jobs.append(request)
 
     logger.debug(f'Acquired {len(jobs)} ready jobs (max_score={max_score}, current={current_time_ms})')

@@ -1,4 +1,5 @@
 import logging
+import logging.config
 import uuid
 import time
 import httpx
@@ -21,49 +22,38 @@ from redis_queue import (
 # Maximum delay: 2,147,483,647 seconds (max 32-bit int, ~68 years)
 MAX_DELAY_SECONDS = 2147483647
 
-logging.basicConfig(
-    level=config.LOGGING_LEVEL,
-    format='[%(levelname)s] %(message)s'
-)
+logging.config.dictConfig(config.LOGGING_CONFIG)
 logger = logging.getLogger(__name__)
 
 
 async def forward_request(request: DelayedRequest) -> None:
+    rid = request.request_id
+    url = request.target_url
     start_time = time.time()
-    
+    status = None
+    error = None
+
+    logger.info(f'[{rid}] FORWARD url={url}')
+
     try:
-        logger.info(
-            f'[{request.request_id}] Forwarding {request.method} '
-            f'{request.target_url}'
-        )
-        
         async with httpx.AsyncClient(timeout=30.0) as client:
             response = await client.request(
                 method=request.method,
-                url=request.target_url,
+                url=url,
                 headers=request.headers,
                 json=request.body
             )
-            
-            elapsed = int((time.time() - start_time) * 1000)
-            logger.info(
-                f'[{request.request_id}] Response: '
-                f'{response.status_code} ({elapsed}ms)'
-            )
-    
+        status = response.status_code
     except httpx.TimeoutException:
-        logger.error(
-            f'[{request.request_id}] Timeout after 30s '
-            f'forwarding to {request.target_url}'
-        )
-    except httpx.RequestError as e:
-        logger.error(
-            f'[{request.request_id}] Request error: {e.__class__.__name__} - {e}'
-        )
+        error = 'TIMEOUT'
     except Exception as e:
-        logger.error(
-            f'[{request.request_id}] Unexpected error: {e.__class__.__name__} - {e}'
-        )
+        error = f'{e.__class__.__name__}: {e}'
+    finally:
+        elapsed_ms = int((time.time() - start_time) * 1000)
+        if status:
+            logger.info(f'[{rid}] RESPONSE status={status} time={elapsed_ms}ms')
+        else:
+            logger.error(f'[{rid}] FORWARD_ERROR error={error} time={elapsed_ms}ms')
 
 
 async def poll_and_process_jobs():
@@ -73,18 +63,15 @@ async def poll_and_process_jobs():
     Uses ZRANGEBYSCORE to retrieve all ready jobs, processes them all,
     then removes them with ZREMRANGEBYSCORE.
     """
-    logger.info('Worker started - polling for ready jobs (batch mode)')
+    logger.info('WORKER_START mode=batch')
 
     while True:
         try:
-            # Acquire ALL ready jobs in batch
             jobs, max_score = await acquire_ready_jobs()
 
             if jobs:
-                # Jobs acquired - process all of them
-                logger.info(f'Acquired {len(jobs)} jobs for batch processing')
+                logger.info(f'BATCH_ACQUIRE count={len(jobs)}')
 
-                # Process each job
                 for request in jobs:
                     now = datetime.now(timezone.utc)
                     actual_delay = (now - request.timestamp).total_seconds()
@@ -96,40 +83,32 @@ async def poll_and_process_jobs():
 
                     delay_diff = actual_delay - intended_delay
                     logger.info(
-                        f'[{request.request_id}] Processing (intended: {intended_delay:.2f}s, '
-                        f'actual: {actual_delay:.2f}s, diff: {delay_diff:+.2f}s)'
+                        f'[{request.request_id}] PROCESS intended={intended_delay:.2f}s '
+                        f'actual={actual_delay:.2f}s diff={delay_diff:+.2f}s'
                     )
 
-                    # Forward the request (never raises exceptions)
                     await forward_request(request)
 
-                # All jobs processed - remove them from queue
                 removed = await cleanup_processed_jobs(max_score)
-                logger.info(f'Batch complete: processed {len(jobs)} jobs, removed {removed} from queue')
-
-                # Don't sleep - immediately check for next batch
+                logger.info(f'BATCH_DONE processed={len(jobs)} removed={removed}')
             else:
-                # No jobs ready - sleep before next poll
                 await asyncio.sleep(config.POLL_INTERVAL_SECONDS)
 
         except Exception as e:
-            logger.error(f'Worker error: {e}', exc_info=True)
+            logger.error(f'WORKER_ERROR error={e}', exc_info=True)
             await asyncio.sleep(config.POLL_INTERVAL_SECONDS)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Initialize Redis connection
     await get_redis_client()
-    logger.info('Redis connection established')
+    logger.info('REDIS_CONNECT status=ok')
 
-    # Start worker task
     worker_task = asyncio.create_task(poll_and_process_jobs())
-    logger.info('Background worker task started')
+    logger.info('WORKER_TASK status=started')
 
     yield
 
-    # Shutdown
     worker_task.cancel()
     try:
         await worker_task
@@ -137,7 +116,7 @@ async def lifespan(app: FastAPI):
         pass
 
     await close_redis_client()
-    logger.info('Application shutdown complete')
+    logger.info('SHUTDOWN status=complete')
 
 
 app = FastAPI(title='Basic HTTP Scheduling', lifespan=lifespan)
@@ -159,7 +138,7 @@ async def health_check():
             **stats
         }
     except Exception as e:
-        logger.error(f'Health check failed: {e}')
+        logger.error(f'HEALTH_CHECK status=failed error={e}')
         return JSONResponse(
             status_code=503,
             content={'status': 'unhealthy', 'error': str(e)}
@@ -191,14 +170,11 @@ async def proxy_request(
     request_id = str(uuid.uuid4())
     timestamp = datetime.now(timezone.utc)
 
-    logger.info(f'[{request_id}] Received request: POST {target_url}')
+    logger.info(f'[{request_id}] REQUEST url={target_url}')
 
-    # Validate API key
     if x_api_key != config.PROXY_API_KEY:
-        logger.warning(f'[{request_id}] Invalid API key attempt')
+        logger.warning(f'[{request_id}] AUTH_FAIL reason=invalid_api_key')
         raise HTTPException(status_code=401, detail='Invalid API key')
-
-    logger.info(f'[{request_id}] API key validated')
 
     # Validate scheduling headers (mutually exclusive)
     if x_delay_seconds is not None and x_schedule_at is not None:
@@ -234,12 +210,10 @@ async def proxy_request(
         execution_time_ms = int(schedule_dt.timestamp() * 1000)
         delay_timestamp_field = schedule_dt
 
-    # Parse body
     try:
         body = await request.json()
-        logger.info(f'[{request_id}] Body parsed successfully')
     except Exception as e:
-        logger.warning(f'[{request_id}] No JSON body: {e}')
+        logger.warning(f'[{request_id}] BODY_PARSE error={e}')
         body = None
 
     # Filter headers
@@ -262,9 +236,11 @@ async def proxy_request(
 
     try:
         await enqueue_request(delayed_req, execution_time_ms)
-        logger.info(f'[{request_id}] Queued: {target_url} ({delayed_req.get_display_delay()})')
+        logger.info(
+            f'[{request_id}] ENQUEUE url={target_url} '
+            f'delay={delayed_req.get_display_delay()} exec_time_ms={execution_time_ms}'
+        )
 
-        # Build response based on scheduling method
         response_content = {
             'message': f'Request queued.',
             'request_id': request_id,
@@ -277,28 +253,30 @@ async def proxy_request(
 
         return JSONResponse(status_code=201, content=response_content)
     except Exception as e:
-        logger.error(f'[{request_id}] Failed to queue: {e}')
+        logger.error(f'[{request_id}] ENQUEUE_FAIL error={e}')
         raise HTTPException(status_code=500, detail='Failed to queue request')
 
 
 if __name__ == '__main__':
     import uvicorn
-    logger.info(f'Starting Basic HTTP Scheduling on {config.API_HOST}:{config.API_PORT}')
 
-    # Check if uvloop is available and use it with uvicorn
+    logger.info(f'APP_START host={config.API_HOST} port={config.API_PORT}')
+
     try:
         import uvloop
-        logger.info(f'Using uvloop {uvloop.__version__} for event loop')
+        logger.info(f'EVENT_LOOP type=uvloop version={uvloop.__version__}')
         uvicorn.run(
             app,
             host=config.API_HOST,
             port=config.API_PORT,
-            loop='uvloop'
+            loop='uvloop',
+            log_config=config.LOGGING_CONFIG
         )
     except ImportError:
-        logger.warning('uvloop not available, using default asyncio event loop')
+        logger.warning('EVENT_LOOP type=asyncio note=uvloop_not_available')
         uvicorn.run(
             app,
             host=config.API_HOST,
-            port=config.API_PORT
+            port=config.API_PORT,
+            log_config=config.LOGGING_CONFIG
         )

@@ -21,7 +21,7 @@ async def get_redis_client() -> aioredis.Redis:
             socket_timeout=5.0,
             socket_connect_timeout=5.0,
         )
-        logger.info(f'Connected to Redis at {config.REDIS_HOST}:{config.REDIS_PORT}')
+        logger.info(f'REDIS_CONNECT host={config.REDIS_HOST} port={config.REDIS_PORT}')
     return _redis_client
 
 
@@ -30,7 +30,7 @@ async def close_redis_client() -> None:
     global _redis_client
     if _redis_client:
         await _redis_client.close()
-        logger.info('Redis connection closed')
+        logger.info('REDIS_CLOSE status=ok')
         _redis_client = None
 
 
@@ -56,15 +56,10 @@ async def enqueue_request(request: DelayedRequest, execution_time_ms: int) -> No
     )
 
     if added == 0:
-        logger.error(
-            f'[{request.request_id}] FAILED to enqueue - job already exists in queue! '
-            f'This indicates a duplicate request or race condition.'
-        )
+        logger.error(f'[{request.request_id}] REDIS_ZADD status=duplicate')
         raise ValueError(f'Job {request.request_id} already exists in queue')
 
-    logger.info(
-        f'[{request.request_id}] Enqueued at {execution_time_ms}ms ({request.get_display_delay()})'
-    )
+    logger.debug(f'[{request.request_id}] REDIS_ZADD status=ok score={execution_time_ms}')
 
 
 async def acquire_ready_jobs() -> tuple[list[DelayedRequest], float]:
@@ -111,7 +106,7 @@ async def acquire_ready_jobs() -> tuple[list[DelayedRequest], float]:
         request = DelayedRequest.model_validate_json(request_json)
         jobs.append(request)
 
-    logger.debug(f'Acquired {len(jobs)} ready jobs (max_score={max_score}, current={current_time_ms})')
+    logger.debug(f'REDIS_ZRANGEBYSCORE count={len(jobs)} max_score={max_score} current_ms={current_time_ms}')
     return jobs, max_score
 
 
@@ -141,7 +136,7 @@ async def cleanup_processed_jobs(max_score: float) -> int:
         max_score
     )
 
-    logger.debug(f'Cleaned up {removed} processed jobs (score <= {max_score})')
+    logger.debug(f'REDIS_ZREMRANGEBYSCORE removed={removed} max_score={max_score}')
     return removed
 
 

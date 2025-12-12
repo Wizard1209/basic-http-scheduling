@@ -18,3 +18,44 @@ REQUEST_DATA_PREFIX = 'request:'
 
 # Worker configuration
 POLL_INTERVAL_SECONDS = 1.0  # Poll every 1 second
+
+# Unified logging configuration
+LOG_FORMAT = "%(asctime)s.%(msecs)03d [%(levelname)s] %(message)s"
+LOG_DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
+LOG_ACCESS_FORMAT = '%(asctime)s.%(msecs)03d [INFO] HTTP_ACCESS client=%(client_addr)s request="%(request_line)s" status=%(status_code)s'
+
+LOGGING_CONFIG = {
+    "version": 1,
+    "disable_existing_loggers": False,
+    "formatters": {
+        "default": {
+            "format": LOG_FORMAT,
+            "datefmt": LOG_DATE_FORMAT,
+        },
+        "access": {
+            "format": LOG_ACCESS_FORMAT,
+            "datefmt": LOG_DATE_FORMAT,
+        },
+    },
+    "handlers": {
+        "default": {
+            "formatter": "default",
+            "class": "logging.StreamHandler",
+            "stream": "ext://sys.stdout",
+        },
+        "access": {
+            "formatter": "access",
+            "class": "logging.StreamHandler",
+            "stream": "ext://sys.stdout",
+        },
+    },
+    "loggers": {
+        "uvicorn": {"handlers": ["default"], "level": LOGGING_LEVEL, "propagate": False},
+        "uvicorn.error": {"level": LOGGING_LEVEL},
+        "uvicorn.access": {"handlers": ["access"], "level": LOGGING_LEVEL, "propagate": False},
+    },
+    "root": {
+        "level": LOGGING_LEVEL,
+        "handlers": ["default"],
+    },
+}

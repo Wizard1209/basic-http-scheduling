@@ -33,7 +33,8 @@ LOGGING_CONFIG = {
             "datefmt": LOG_DATE_FORMAT,
         },
         "access": {
-            "format": LOG_ACCESS_FORMAT,
+            "()": "uvicorn.logging.AccessFormatter",
+            "fmt": LOG_ACCESS_FORMAT,
             "datefmt": LOG_DATE_FORMAT,
         },
     },

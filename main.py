@@ -33,7 +33,7 @@ async def forward_request(request: DelayedRequest) -> None:
     status = None
     error = None
 
-    logger.info(f'[{rid}] FORWARD url={url}')
+    logger.info(f'FORWARD [{rid}] url={url}')
 
     try:
         async with httpx.AsyncClient(timeout=30.0) as client:
@@ -51,9 +51,9 @@ async def forward_request(request: DelayedRequest) -> None:
     finally:
         elapsed_ms = int((time.time() - start_time) * 1000)
         if status:
-            logger.info(f'[{rid}] RESPONSE status={status} time={elapsed_ms}ms')
+            logger.info(f'RESPONSE [{rid}] status={status} time={elapsed_ms}ms')
         else:
-            logger.error(f'[{rid}] FORWARD_ERROR error={error} time={elapsed_ms}ms')
+            logger.error(f'FORWARD_ERROR [{rid}] error={error} time={elapsed_ms}ms')
 
 
 async def poll_and_process_jobs():
@@ -83,7 +83,7 @@ async def poll_and_process_jobs():
 
                     delay_diff = actual_delay - intended_delay
                     logger.info(
-                        f'[{request.request_id}] PROCESS intended={intended_delay:.2f}s '
+                        f'PROCESS [{request.request_id}] intended={intended_delay:.2f}s '
                         f'actual={actual_delay:.2f}s diff={delay_diff:+.2f}s'
                     )
 
@@ -170,10 +170,10 @@ async def proxy_request(
     request_id = str(uuid.uuid4())
     timestamp = datetime.now(timezone.utc)
 
-    logger.info(f'[{request_id}] REQUEST url={target_url}')
+    logger.info(f'REQUEST [{request_id}] url={target_url}')
 
     if x_api_key != config.PROXY_API_KEY:
-        logger.warning(f'[{request_id}] AUTH_FAIL reason=invalid_api_key')
+        logger.warning(f'AUTH_FAIL [{request_id}] reason=invalid_api_key')
         raise HTTPException(status_code=401, detail='Invalid API key')
 
     # Validate scheduling headers (mutually exclusive)
@@ -213,7 +213,7 @@ async def proxy_request(
     try:
         body = await request.json()
     except Exception as e:
-        logger.warning(f'[{request_id}] BODY_PARSE error={e}')
+        logger.warning(f'BODY_PARSE [{request_id}] error={e}')
         body = None
 
     # Filter headers
@@ -237,7 +237,7 @@ async def proxy_request(
     try:
         await enqueue_request(delayed_req, execution_time_ms)
         logger.info(
-            f'[{request_id}] ENQUEUE url={target_url} '
+            f'ENQUEUE [{request_id}] url={target_url} '
             f'delay={delayed_req.get_display_delay()} exec_time_ms={execution_time_ms}'
         )
 
@@ -253,7 +253,7 @@ async def proxy_request(
 
         return JSONResponse(status_code=201, content=response_content)
     except Exception as e:
-        logger.error(f'[{request_id}] ENQUEUE_FAIL error={e}')
+        logger.error(f'ENQUEUE_FAIL [{request_id}] error={e}')
         raise HTTPException(status_code=500, detail='Failed to queue request')
 
 

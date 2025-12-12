@@ -56,10 +56,10 @@ async def enqueue_request(request: DelayedRequest, execution_time_ms: int) -> No
     )
 
     if added == 0:
-        logger.error(f'[{request.request_id}] REDIS_ZADD status=duplicate')
+        logger.error(f'REDIS_ZADD [{request.request_id}] status=duplicate')
         raise ValueError(f'Job {request.request_id} already exists in queue')
 
-    logger.debug(f'[{request.request_id}] REDIS_ZADD status=ok score={execution_time_ms}')
+    logger.debug(f'REDIS_ZADD [{request.request_id}] status=ok score={execution_time_ms}')
 
 
 async def acquire_ready_jobs() -> tuple[list[DelayedRequest], float]:

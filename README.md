@@ -19,7 +19,7 @@ Self-hosted HTTP proxy for scheduling delayed message delivery. Accepts requests
 
 ## Log Events Reference
 
-Format: `YYYY-MM-DD HH:MM:SS.mmm [LEVEL] EVENT key=value ...`
+Format: `YYYY-MM-DD HH:MM:SS.mmm [LEVEL] EVENT [request_id] key=value ...`
 
 ### Startup
 | Event | Level | Description |
